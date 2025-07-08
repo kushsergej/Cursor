@@ -1,0 +1,7 @@
+---
+alwaysApply: true
+---
+
+If you need to generate images, use "image-generator" MCP tool with quality set to "High" and realistic style.
+Image files should be in JPEG format.
+Before generating, make sure the "gpt_images" folder exists; otherwise the generated image would not be saved
