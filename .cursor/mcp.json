@@ -15,12 +15,6 @@
     },
     "GitLab": {
       "command": "/opt/homebrew/bin/gitlab-mcp"
-    },
-    "image-generator": {
-      "command": "image-generator",
-      "env": {
-        "OPENAI_API_KEY": "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"
-      }
     }
   }
 }
