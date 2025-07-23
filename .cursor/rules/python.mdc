@@ -1,0 +1,6 @@
+---
+alwaysApply: false
+---
+
+Add print(“debugging: …”) statements in relevant parts of the code and then run the code or tests using the terminal.
+Use uv and run with python3
