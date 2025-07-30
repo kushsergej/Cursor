@@ -1,9 +1,24 @@
 stages:
   - backup
+  - notify
+
+variables:
+  # Email configuration
+  SMTP_SERVER: ${SMTP_SERVER:-"smtp.gmail.com"}
+  SMTP_PORT: ${SMTP_PORT:-"587"}
+  SMTP_USERNAME: ${SMTP_USERNAME}
+  SMTP_PASSWORD: ${SMTP_PASSWORD}
+  EMAIL_FROM: ${EMAIL_FROM}
+  EMAIL_TO: ${EMAIL_TO}
+  EMAIL_SUBJECT_PREFIX: "[Azure PostgreSQL Backup]"
 
 backup_db:
   stage: backup
   image: mcr.microsoft.com/azure-cli
+  before_script:
+    # Install additional tools for email functionality
+    - apk add --no-cache python3 py3-pip
+    - pip3 install yagmail
   script:
     - bash ./backup_db.sh
   variables:
@@ -13,4 +28,230 @@ backup_db:
     AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
     AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
     AZURE_VAULT_NAME: $AZURE_VAULT_NAME
+    AZURE_LOCATION: $AZURE_LOCATION
+  artifacts:
+    reports:
+      dotenv: backup_results.env
+    paths:
+      - backup_results.env
+    expire_in: 1 day
+    when: always
   when: manual
+
+# Email notification for successful backups
+notify_success:
+  stage: notify
+  image: python:3.9-alpine
+  dependencies:
+    - backup_db
+  before_script:
+    - pip install yagmail
+  script:
+    - |
+      python3 << 'EOF'
+      import yagmail
+      import os
+      from datetime import datetime
+      
+      # Email configuration
+      smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+      smtp_port = int(os.getenv('SMTP_PORT', '587'))
+      smtp_username = os.getenv('SMTP_USERNAME')
+      smtp_password = os.getenv('SMTP_PASSWORD')
+      email_from = os.getenv('EMAIL_FROM', smtp_username)
+      email_to = os.getenv('EMAIL_TO').split(',') if os.getenv('EMAIL_TO') else []
+      
+      # Backup results
+      total_db = os.getenv('BACKUP_TOTAL_DATABASES', '0')
+      successful = os.getenv('BACKUP_SUCCESSFUL', '0')
+      failed = os.getenv('BACKUP_FAILED', '0')
+      duration = os.getenv('BACKUP_DURATION', 'Unknown')
+      start_time = os.getenv('BACKUP_START_TIME', 'Unknown')
+      end_time = os.getenv('BACKUP_END_TIME', 'Unknown')
+      details = os.getenv('BACKUP_DETAILS', 'No details available')
+      
+      # Build email content
+      subject = f"{os.getenv('EMAIL_SUBJECT_PREFIX')} ✅ Backup Completed Successfully"
+      
+      body = f"""
+      🎉 Azure PostgreSQL Database Backup Completed Successfully!
+      
+      📊 Backup Summary:
+      • Total databases: {total_db}
+      • Successful backups: {successful}
+      • Failed backups: {failed}
+      • Duration: {duration}
+      • Start time: {start_time}
+      • End time: {end_time}
+      
+      📋 Backup Details:
+      {details.replace('\\n', chr(10))}
+      
+      🔗 Pipeline Details:
+      • Project: {os.getenv('CI_PROJECT_NAME', 'Unknown')}
+      • Pipeline: {os.getenv('CI_PIPELINE_URL', 'Unknown')}
+      • Job: {os.getenv('CI_JOB_URL', 'Unknown')}
+      • Commit: {os.getenv('CI_COMMIT_SHORT_SHA', 'Unknown')}
+      
+      This is an automated notification from your GitLab CI/CD pipeline.
+      """
+      
+      # Send email
+      if email_to and smtp_username and smtp_password:
+          yag = yagmail.SMTP(smtp_username, smtp_password, host=smtp_server, port=smtp_port)
+          yag.send(to=email_to, subject=subject, contents=body)
+          print("✅ Success notification email sent successfully!")
+      else:
+          print("⚠️ Email configuration incomplete. Skipping notification.")
+      EOF
+  only:
+    variables:
+      - $BACKUP_FAILED == "0"
+  when: on_success
+
+# Email notification for failed backups
+notify_failure:
+  stage: notify
+  image: python:3.9-alpine
+  dependencies:
+    - backup_db
+  before_script:
+    - pip install yagmail
+  script:
+    - |
+      python3 << 'EOF'
+      import yagmail
+      import os
+      from datetime import datetime
+      
+      # Email configuration
+      smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+      smtp_port = int(os.getenv('SMTP_PORT', '587'))
+      smtp_username = os.getenv('SMTP_USERNAME')
+      smtp_password = os.getenv('SMTP_PASSWORD')
+      email_from = os.getenv('EMAIL_FROM', smtp_username)
+      email_to = os.getenv('EMAIL_TO').split(',') if os.getenv('EMAIL_TO') else []
+      
+      # Backup results
+      total_db = os.getenv('BACKUP_TOTAL_DATABASES', '0')
+      successful = os.getenv('BACKUP_SUCCESSFUL', '0')
+      failed = os.getenv('BACKUP_FAILED', '0')
+      duration = os.getenv('BACKUP_DURATION', 'Unknown')
+      start_time = os.getenv('BACKUP_START_TIME', 'Unknown')
+      end_time = os.getenv('BACKUP_END_TIME', 'Unknown')
+      details = os.getenv('BACKUP_DETAILS', 'No details available')
+      
+      # Build email content
+      subject = f"{os.getenv('EMAIL_SUBJECT_PREFIX')} ❌ Backup Failed"
+      
+      body = f"""
+      🚨 Azure PostgreSQL Database Backup Failed!
+      
+      📊 Backup Summary:
+      • Total databases: {total_db}
+      • Successful backups: {successful}
+      • Failed backups: {failed}
+      • Duration: {duration}
+      • Start time: {start_time}
+      • End time: {end_time}
+      
+      📋 Backup Details:
+      {details.replace('\\n', chr(10))}
+      
+      🔗 Pipeline Details:
+      • Project: {os.getenv('CI_PROJECT_NAME', 'Unknown')}
+      • Pipeline: {os.getenv('CI_PIPELINE_URL', 'Unknown')}
+      • Job: {os.getenv('CI_JOB_URL', 'Unknown')}
+      • Commit: {os.getenv('CI_COMMIT_SHORT_SHA', 'Unknown')}
+      
+      ⚠️ Please review the pipeline logs and take appropriate action.
+      
+      This is an automated notification from your GitLab CI/CD pipeline.
+      """
+      
+      # Send email
+      if email_to and smtp_username and smtp_password:
+          yag = yagmail.SMTP(smtp_username, smtp_password, host=smtp_server, port=smtp_port)
+          yag.send(to=email_to, subject=subject, contents=body)
+          print("✅ Failure notification email sent successfully!")
+      else:
+          print("⚠️ Email configuration incomplete. Skipping notification.")
+      EOF
+  when: on_failure
+
+# General notification job that always runs
+notify_always:
+  stage: notify
+  image: python:3.9-alpine
+  dependencies:
+    - backup_db
+  before_script:
+    - pip install yagmail
+  script:
+    - |
+      python3 << 'EOF'
+      import yagmail
+      import os
+      from datetime import datetime
+      
+      # Email configuration
+      smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+      smtp_port = int(os.getenv('SMTP_PORT', '587'))
+      smtp_username = os.getenv('SMTP_USERNAME')
+      smtp_password = os.getenv('SMTP_PASSWORD')
+      email_from = os.getenv('EMAIL_FROM', smtp_username)
+      email_to = os.getenv('EMAIL_TO').split(',') if os.getenv('EMAIL_TO') else []
+      
+      # Backup results
+      total_db = os.getenv('BACKUP_TOTAL_DATABASES', '0')
+      successful = os.getenv('BACKUP_SUCCESSFUL', '0')
+      failed = os.getenv('BACKUP_FAILED', '0')
+      duration = os.getenv('BACKUP_DURATION', 'Unknown')
+      start_time = os.getenv('BACKUP_START_TIME', 'Unknown')
+      end_time = os.getenv('BACKUP_END_TIME', 'Unknown')
+      details = os.getenv('BACKUP_DETAILS', 'No details available')
+      
+      # Determine status
+      if int(failed) > 0:
+          status_emoji = "❌"
+          status_text = "FAILED"
+      else:
+          status_emoji = "✅"
+          status_text = "SUCCESS"
+      
+      # Build email content
+      subject = f"{os.getenv('EMAIL_SUBJECT_PREFIX')} {status_emoji} Backup {status_text}"
+      
+      body = f"""
+      {status_emoji} Azure PostgreSQL Database Backup {status_text}
+      
+      📊 Backup Summary:
+      • Total databases: {total_db}
+      • Successful backups: {successful}
+      • Failed backups: {failed}
+      • Duration: {duration}
+      • Start time: {start_time}
+      • End time: {end_time}
+      
+      📋 Backup Details:
+      {details.replace('\\n', chr(10))}
+      
+      🔗 Pipeline Details:
+      • Project: {os.getenv('CI_PROJECT_NAME', 'Unknown')}
+      • Pipeline: {os.getenv('CI_PIPELINE_URL', 'Unknown')}
+      • Job: {os.getenv('CI_JOB_URL', 'Unknown')}
+      • Commit: {os.getenv('CI_COMMIT_SHORT_SHA', 'Unknown')}
+      
+      This is an automated notification from your GitLab CI/CD pipeline.
+      """
+      
+      # Send email
+      if email_to and smtp_username and smtp_password:
+          yag = yagmail.SMTP(smtp_username, smtp_password, host=smtp_server, port=smtp_port)
+          yag.send(to=email_to, subject=subject, contents=body)
+          print(f"✅ Backup notification email sent successfully! Status: {status_text}")
+      else:
+          print("⚠️ Email configuration incomplete. Skipping notification.")
+          print("Required variables: EMAIL_TO, SMTP_USERNAME, SMTP_PASSWORD")
+      EOF
+  when: always
