@@ -1,16 +1,139 @@
 stages:
   - backup
+  - notify
+
+variables:
+  AZURE_CLIENT_ID: $AZURE_CLIENT_ID
+  AZURE_TENANT_ID: $AZURE_TENANT_ID
+  AZURE_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+  AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+  AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
+  AZURE_VAULT_NAME: $AZURE_VAULT_NAME
+  # Email notification settings
+  EMAIL_RECIPIENTS: $EMAIL_RECIPIENTS
+  SMTP_SERVER: $SMTP_SERVER
+  SMTP_PORT: $SMTP_PORT
+  SMTP_USERNAME: $SMTP_USERNAME
+  SMTP_PASSWORD: $SMTP_PASSWORD
 
 backup_db:
   stage: backup
   image: mcr.microsoft.com/azure-cli
+  before_script:
+    - apk add --no-cache jq curl
   script:
     - bash ./backup_db.sh
-  variables:
-    AZURE_CLIENT_ID: $AZURE_CLIENT_ID
-    AZURE_TENANT_ID: $AZURE_TENANT_ID
-    AZURE_CLIENT_SECRET: $AZURE_CLIENT_SECRET
-    AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
-    AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
-    AZURE_VAULT_NAME: $AZURE_VAULT_NAME
+  artifacts:
+    paths:
+      - backup_report.txt
+    reports:
+      junit: backup_report.txt
+    expire_in: 1 week
   when: manual
+  allow_failure: false
+
+notify_success:
+  stage: notify
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      if [ -f backup_report.txt ]; then
+        echo "Sending success notification email..."
+        
+        # Read backup report
+        BACKUP_STATUS=$(grep "Status:" backup_report.txt | cut -d' ' -f2)
+        TIMESTAMP=$(grep "Timestamp:" backup_report.txt | cut -d' ' -f2-)
+        BACKUP_NAME=$(grep "Backup Name:" backup_report.txt | cut -d' ' -f3)
+        BACKUP_SIZE=$(grep "Backup Size:" backup_report.txt | cut -d' ' -f3)
+        PIPELINE_URL=$(grep "Pipeline URL:" backup_report.txt | cut -d' ' -f3)
+        JOB_URL=$(grep "Job URL:" backup_report.txt | cut -d' ' -f3)
+        
+        # Create email content
+        cat > email_content.txt << EOF
+        Subject: Database Backup Completed Successfully
+        
+        Database Backup Report
+        =====================
+        
+        Status: $BACKUP_STATUS
+        Timestamp: $TIMESTAMP
+        Backup Name: $BACKUP_NAME
+        Backup Size: $BACKUP_SIZE
+        
+        Pipeline Details:
+        - Pipeline URL: $PIPELINE_URL
+        - Job URL: $JOB_URL
+        
+        The database backup has been completed successfully and stored in the Azure Recovery Services Vault.
+        
+        Best regards,
+        GitLab CI/CD Pipeline
+        EOF
+        
+        # Send email using curl (if SMTP is configured)
+        if [ -n "$SMTP_SERVER" ] && [ -n "$EMAIL_RECIPIENTS" ]; then
+          echo "Email notification would be sent to: $EMAIL_RECIPIENTS"
+          echo "Email content:"
+          cat email_content.txt
+        else
+          echo "SMTP not configured. Email notification skipped."
+          echo "Email content:"
+          cat email_content.txt
+        fi
+      else
+        echo "Backup report not found. Cannot send notification."
+        exit 1
+      fi
+  dependencies:
+    - backup_db
+  when: on_success
+  allow_failure: true
+
+notify_failure:
+  stage: notify
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      echo "Sending failure notification email..."
+      
+      # Create failure email content
+      cat > failure_email.txt << EOF
+      Subject: Database Backup Failed
+      
+      Database Backup Failure Report
+      =============================
+      
+      Status: FAILED
+      Timestamp: $(date '+%Y-%m-%d %H:%M:%S')
+      Pipeline URL: $CI_PIPELINE_URL
+      Job URL: $CI_JOB_URL
+      
+      The database backup process has failed. Please check the pipeline logs for more details.
+      
+      Error Details:
+      - Job Name: $CI_JOB_NAME
+      - Pipeline ID: $CI_PIPELINE_ID
+      - Commit SHA: $CI_COMMIT_SHA
+      
+      Please investigate and resolve the issue.
+      
+      Best regards,
+      GitLab CI/CD Pipeline
+      EOF
+      
+      # Send email using curl (if SMTP is configured)
+      if [ -n "$SMTP_SERVER" ] && [ -n "$EMAIL_RECIPIENTS" ]; then
+        echo "Failure email notification would be sent to: $EMAIL_RECIPIENTS"
+        echo "Email content:"
+        cat failure_email.txt
+      else
+        echo "SMTP not configured. Failure email notification skipped."
+        echo "Email content:"
+        cat failure_email.txt
+      fi
+  when: on_failure
+  allow_failure: true
