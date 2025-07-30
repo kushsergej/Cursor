@@ -1,16 +1,255 @@
 stages:
   - backup
+  - notification
+
+variables:
+  # Azure authentication variables
+  AZURE_CLIENT_ID: $AZURE_CLIENT_ID
+  AZURE_TENANT_ID: $AZURE_TENANT_ID
+  AZURE_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+  AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+  AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
+  AZURE_VAULT_NAME: $AZURE_VAULT_NAME
+  
+  # Email notification variables
+  NOTIFICATION_EMAIL_TO: $NOTIFICATION_EMAIL_TO
+  SMTP_SERVER: $SMTP_SERVER
+  SMTP_PORT: $SMTP_PORT
+  SMTP_USERNAME: $SMTP_USERNAME
+  SMTP_PASSWORD: $SMTP_PASSWORD
+  SMTP_FROM_EMAIL: $SMTP_FROM_EMAIL
 
 backup_db:
   stage: backup
   image: mcr.microsoft.com/azure-cli
   script:
+    - echo "Starting PostgreSQL database backup process..."
     - bash ./backup_db.sh
-  variables:
-    AZURE_CLIENT_ID: $AZURE_CLIENT_ID
-    AZURE_TENANT_ID: $AZURE_TENANT_ID
-    AZURE_CLIENT_SECRET: $AZURE_CLIENT_SECRET
-    AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
-    AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
-    AZURE_VAULT_NAME: $AZURE_VAULT_NAME
+  artifacts:
+    reports:
+      dotenv: backup_results.env
+    paths:
+      - backup_results.env
+    expire_in: 1 week
+    when: always
   when: manual
+  allow_failure: true
+
+send_notification:
+  stage: notification
+  image: alpine:latest
+  dependencies:
+    - backup_db
+  before_script:
+    - apk add --no-cache curl mailx ssmtp
+    - |
+      # Configure ssmtp for email sending
+      cat > /etc/ssmtp/ssmtp.conf << EOF
+      root=${SMTP_FROM_EMAIL}
+      mailhub=${SMTP_SERVER}:${SMTP_PORT}
+      hostname=${CI_PROJECT_NAME}.${CI_SERVER_HOST}
+      AuthUser=${SMTP_USERNAME}
+      AuthPass=${SMTP_PASSWORD}
+      UseSTARTTLS=YES
+      UseTLS=YES
+      EOF
+      chmod 640 /etc/ssmtp/ssmtp.conf
+  script:
+    - |
+      # Source the backup results
+      if [ -f backup_results.env ]; then
+        set -a
+        source backup_results.env
+        set +a
+      else
+        echo "Warning: backup_results.env not found, using default values"
+        SUCCESSFUL_BACKUPS=0
+        FAILED_BACKUPS=1
+        BACKUP_END_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+        TOTAL_SERVERS=0
+        BACKUP_SUMMARY="❌ Backup process failed - no results file generated"
+      fi
+      
+      # Determine email subject and status
+      if [ "$FAILED_BACKUPS" -gt 0 ]; then
+        EMAIL_SUBJECT="🔴 PostgreSQL Backup FAILED - ${CI_PROJECT_NAME}"
+        STATUS_EMOJI="❌"
+        STATUS_TEXT="FAILED"
+        STATUS_COLOR="#FF0000"
+      else
+        EMAIL_SUBJECT="✅ PostgreSQL Backup SUCCESS - ${CI_PROJECT_NAME}"
+        STATUS_EMOJI="✅"
+        STATUS_TEXT="SUCCESS"
+        STATUS_COLOR="#00FF00"
+      fi
+      
+      # Create HTML email content
+      cat > email_content.html << EOF
+      <!DOCTYPE html>
+      <html>
+      <head>
+          <style>
+              body { font-family: Arial, sans-serif; margin: 20px; }
+              .header { background-color: ${STATUS_COLOR}; color: white; padding: 20px; border-radius: 5px; }
+              .content { margin: 20px 0; }
+              .summary-table { border-collapse: collapse; width: 100%; }
+              .summary-table th, .summary-table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+              .summary-table th { background-color: #f2f2f2; }
+              .details { background-color: #f9f9f9; padding: 15px; border-radius: 5px; margin: 10px 0; }
+              .footer { margin-top: 30px; padding: 15px; background-color: #f0f0f0; border-radius: 5px; }
+              .success { color: #008000; }
+              .failure { color: #FF0000; }
+          </style>
+      </head>
+      <body>
+          <div class="header">
+              <h1>${STATUS_EMOJI} PostgreSQL Backup Report - ${STATUS_TEXT}</h1>
+          </div>
+          
+          <div class="content">
+              <h2>Backup Summary</h2>
+              <table class="summary-table">
+                  <tr><th>Property</th><th>Value</th></tr>
+                  <tr><td>Project</td><td>${CI_PROJECT_NAME}</td></tr>
+                  <tr><td>Pipeline</td><td><a href="${CI_PIPELINE_URL}">#${CI_PIPELINE_ID}</a></td></tr>
+                  <tr><td>Status</td><td><span style="color: ${STATUS_COLOR};">${STATUS_TEXT}</span></td></tr>
+                  <tr><td>Completion Time</td><td>${BACKUP_END_TIME}</td></tr>
+                  <tr><td>Total Servers</td><td>${TOTAL_SERVERS}</td></tr>
+                  <tr><td>Successful Backups</td><td class="success">${SUCCESSFUL_BACKUPS}</td></tr>
+                  <tr><td>Failed Backups</td><td class="failure">${FAILED_BACKUPS}</td></tr>
+              </table>
+              
+              <h3>Detailed Results</h3>
+              <div class="details">
+                  <pre>$(echo -e "${BACKUP_SUMMARY}")</pre>
+              </div>
+              
+              <div class="footer">
+                  <p><strong>Links:</strong></p>
+                  <ul>
+                      <li><a href="${CI_PIPELINE_URL}">View Pipeline</a></li>
+                      <li><a href="${CI_JOB_URL}">View Job Logs</a></li>
+                      <li><a href="${CI_PROJECT_URL}">Project Repository</a></li>
+                  </ul>
+                  
+                  <p><strong>Environment Details:</strong></p>
+                  <ul>
+                      <li>Branch: ${CI_COMMIT_REF_NAME}</li>
+                      <li>Commit: ${CI_COMMIT_SHORT_SHA}</li>
+                      <li>Triggered by: ${GITLAB_USER_NAME} (${GITLAB_USER_EMAIL})</li>
+                  </ul>
+              </div>
+          </div>
+      </body>
+      </html>
+      EOF
+      
+      # Create plain text version for compatibility
+      cat > email_content.txt << EOF
+      PostgreSQL Backup Report - ${STATUS_TEXT}
+      =====================================
+      
+      Project: ${CI_PROJECT_NAME}
+      Pipeline: #${CI_PIPELINE_ID}
+      Status: ${STATUS_TEXT}
+      Completion Time: ${BACKUP_END_TIME}
+      
+      Summary:
+      - Total Servers: ${TOTAL_SERVERS}
+      - Successful Backups: ${SUCCESSFUL_BACKUPS}
+      - Failed Backups: ${FAILED_BACKUPS}
+      
+      Detailed Results:
+      $(echo -e "${BACKUP_SUMMARY}")
+      
+      Links:
+      - Pipeline: ${CI_PIPELINE_URL}
+      - Job Logs: ${CI_JOB_URL}
+      - Repository: ${CI_PROJECT_URL}
+      
+      Environment:
+      - Branch: ${CI_COMMIT_REF_NAME}
+      - Commit: ${CI_COMMIT_SHORT_SHA}
+      - Triggered by: ${GITLAB_USER_NAME} (${GITLAB_USER_EMAIL})
+      EOF
+      
+      # Send email notification
+      echo "Sending email notification to: ${NOTIFICATION_EMAIL_TO}"
+      
+      # Send HTML email with fallback to plain text
+      (
+        echo "To: ${NOTIFICATION_EMAIL_TO}"
+        echo "From: ${SMTP_FROM_EMAIL}"
+        echo "Subject: ${EMAIL_SUBJECT}"
+        echo "Content-Type: text/html; charset=UTF-8"
+        echo ""
+        cat email_content.html
+      ) | ssmtp "${NOTIFICATION_EMAIL_TO}" || (
+        echo "HTML email failed, trying plain text..."
+        (
+          echo "To: ${NOTIFICATION_EMAIL_TO}"
+          echo "From: ${SMTP_FROM_EMAIL}"
+          echo "Subject: ${EMAIL_SUBJECT}"
+          echo "Content-Type: text/plain; charset=UTF-8"
+          echo ""
+          cat email_content.txt
+        ) | ssmtp "${NOTIFICATION_EMAIL_TO}"
+      )
+      
+      echo "Email notification sent successfully"
+  artifacts:
+    paths:
+      - email_content.html
+      - email_content.txt
+    expire_in: 1 week
+    when: always
+  when: always
+
+# Alternative notification job using curl for webhook-based notifications
+send_webhook_notification:
+  stage: notification
+  image: alpine:latest
+  dependencies:
+    - backup_db
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - |
+      # Source the backup results
+      if [ -f backup_results.env ]; then
+        set -a
+        source backup_results.env
+        set +a
+      else
+        SUCCESSFUL_BACKUPS=0
+        FAILED_BACKUPS=1
+        BACKUP_END_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+        TOTAL_SERVERS=0
+        BACKUP_SUMMARY="❌ Backup process failed - no results file generated"
+      fi
+      
+      # Send webhook notification (if WEBHOOK_URL is configured)
+      if [ -n "$WEBHOOK_URL" ]; then
+        echo "Sending webhook notification..."
+        
+        curl -X POST "$WEBHOOK_URL" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"project\": \"${CI_PROJECT_NAME}\",
+            \"pipeline_id\": \"${CI_PIPELINE_ID}\",
+            \"pipeline_url\": \"${CI_PIPELINE_URL}\",
+            \"status\": \"$([ $FAILED_BACKUPS -gt 0 ] && echo 'FAILED' || echo 'SUCCESS')\",
+            \"completion_time\": \"${BACKUP_END_TIME}\",
+            \"total_servers\": ${TOTAL_SERVERS},
+            \"successful_backups\": ${SUCCESSFUL_BACKUPS},
+            \"failed_backups\": ${FAILED_BACKUPS},
+            \"summary\": \"${BACKUP_SUMMARY}\",
+            \"triggered_by\": \"${GITLAB_USER_NAME}\",
+            \"branch\": \"${CI_COMMIT_REF_NAME}\",
+            \"commit\": \"${CI_COMMIT_SHORT_SHA}\"
+          }" || echo "Webhook notification failed"
+      else
+        echo "WEBHOOK_URL not configured, skipping webhook notification"
+      fi
+  when: always
+  allow_failure: true
