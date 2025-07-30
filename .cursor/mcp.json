@@ -1,20 +1,36 @@
 {
   "mcpServers": {
-    "Playwright": {
+    "playwright": {
       "command": "npx @playwright/mcp@latest",
-      "env": {}
+      "env": {},
+      "args": []
+    },
+    "Context7": {
+      "url": "https://mcp.context7.com/mcp",
+      "headers": {}
     },
     "GitHub": {
       "command": "docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server",
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": ""
-      }
-    },
-    "Context7": {
-      "url": "https://mcp.context7.com/mcp"
+      },
+      "args": []
     },
     "GitLab": {
-      "command": "/opt/homebrew/bin/gitlab-mcp"
+      "command": "docker run -i --rm -e GITLAB_PERSONAL_ACCESS_TOKEN -e GITLAB_API_URL -e GITLAB_READ_ONLY_MODE -e USE_GITLAB_WIKI -e USE_MILESTONE -e USE_PIPELINE iwakitakuma/gitlab-mcp",
+      "env": {
+        "GITLAB_PERSONAL_ACCESS_TOKEN": "your_gitlab_token",
+        "GITLAB_API_URL": "https://gitlab.com/api/v4",
+        "GITLAB_READ_ONLY_MODE": "false",
+        "USE_GITLAB_WIKI": "true",
+        "USE_MILESTONE": "true",
+        "USE_PIPELINE": "true"
+      },
+      "args": []
+    },
+    "MS Learn Docs": {
+      "url": "https://learn.microsoft.com/api/mcp",
+      "headers": {}
     }
   }
 }
