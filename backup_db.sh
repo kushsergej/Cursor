@@ -60,4 +60,4 @@ for SERVER in $PG_SERVERS; do
   done
 done
 
-echo_log "All database backups and uploads completed." 
+echo_log "All database backups and uploads completed."
