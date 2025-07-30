@@ -5,7 +5,62 @@ backup_db:
   stage: backup
   image: mcr.microsoft.com/azure-cli
   script:
+    - set -e
+    # Install utility packages (jq for JSON parsing, curl for notifications, mailutils optional)
+    - apt-get update -y && apt-get install -y jq curl > /dev/null
+
+    # Execute the main backup helper script (handles Azure login & vault creation)
     - bash ./backup_db.sh
+
+    #-----------------------------------------------------------------------
+    # List all PostgreSQL Flexible Servers and their databases, then
+    # trigger an on-demand backup for each server
+    #-----------------------------------------------------------------------
+    - echo "Listing PostgreSQL Flexible Servers in RG: $AZURE_RESOURCE_GROUP …"
+    - |
+      SERVERS=$(az postgres flexible-server list --resource-group "$AZURE_RESOURCE_GROUP" --query "[].name" -o tsv)
+      echo "Found servers: $SERVERS"
+
+      DB_REPORT=""
+      for SERVER in $SERVERS; do
+        echo "\n=== $SERVER ==="
+        echo "Listing databases …"
+        az postgres flexible-server db list --resource-group "$AZURE_RESOURCE_GROUP" --server-name "$SERVER" -o table || true
+
+        echo "Triggering on-demand backup for $SERVER …"
+        az postgres flexible-server backup create --resource-group "$AZURE_RESOURCE_GROUP" --server-name "$SERVER"
+
+        # Capture latest backup metadata for reporting (may take a short while to appear)
+        BACKUP_INFO=$(az postgres flexible-server backup list --resource-group "$AZURE_RESOURCE_GROUP" --server-name "$SERVER" --query "[-1]" -o json || echo "{}")
+        BACKUP_NAME=$(echo "$BACKUP_INFO" | jq -r '.name // "n/a"')
+        BACKUP_SIZE=$(echo "$BACKUP_INFO" | jq -r '.backupFileSizeInMb // "n/a"')
+        BACKUP_TIME=$(echo "$BACKUP_INFO" | jq -r '.completedTime // "n/a"')
+        DB_REPORT+="\n$SERVER  |  $BACKUP_NAME  |  ${BACKUP_SIZE}MB  |  $BACKUP_TIME"
+      done
+
+      # Persist report for later stages / artifacts if desired
+      echo -e "Server | Backup | Size | Time$DB_REPORT" > backup_report.txt
+
+    #-----------------------------------------------------------------------
+    # Send email notification (optional – requires CI variables)
+    #-----------------------------------------------------------------------
+    - |
+      STATUS="SUCCESS"
+      if [ "$CI_JOB_STATUS" != "success" ]; then STATUS="FAILED"; fi
+
+      SUBJECT="Azure PG Backup $STATUS – pipeline $CI_PIPELINE_ID"
+      BODY="Backup status: $STATUS\nTimestamp: $(date)\nPipeline: $CI_PIPELINE_URL\nJob log: $CI_JOB_URL\n\n$(cat backup_report.txt)"
+
+      # Preferred: send via REST API (e.g. Mailgun / SendGrid). Requires EMAIL_API_ENDPOINT & EMAIL_API_KEY.
+      if [ -n "$EMAIL_API_ENDPOINT" ] && [ -n "$EMAIL_API_KEY" ] && [ -n "$EMAIL_TO" ]; then
+        echo "Sending notification email via API …"
+        curl -s -X POST "$EMAIL_API_ENDPOINT" \
+          -H "Authorization: Bearer $EMAIL_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "{\"to\":\"$EMAIL_TO\",\"subject\":\"$SUBJECT\",\"text\":\"$BODY\"}" || echo "Email send failed (non-fatal)"
+      else
+        echo "Email variables not set – skipping email notification."
+      fi
   variables:
     AZURE_CLIENT_ID: $AZURE_CLIENT_ID
     AZURE_TENANT_ID: $AZURE_TENANT_ID
@@ -13,4 +68,7 @@ backup_db:
     AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
     AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
     AZURE_VAULT_NAME: $AZURE_VAULT_NAME
+    EMAIL_TO: $EMAIL_TO
+    EMAIL_API_ENDPOINT: $EMAIL_API_ENDPOINT
+    EMAIL_API_KEY: $EMAIL_API_KEY
   when: manual
