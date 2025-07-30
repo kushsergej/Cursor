@@ -4,11 +4,7 @@
     "terminals": [
         {
             "name": "Install az cli",
-            "command": "apt-get update && apt-get install azure-cli; az version"
-        },
-        {
-            "name": "show os version",
-            "command": "cat /etc/os-release"
+            "command": "apt-get update && apt-get install azure-cli &&az version"
         }
     ]
 }
