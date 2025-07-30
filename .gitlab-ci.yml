@@ -5,53 +5,68 @@ backup_db:
   stage: backup
   image: mcr.microsoft.com/azure-cli
   script:
-    - set -e
-    # Install utility packages (jq for JSON parsing, curl for notifications, mailutils optional)
-    - apt-get update -y && apt-get install -y jq curl > /dev/null
-
-    # Execute the main backup helper script (handles Azure login & vault creation)
-    - bash ./backup_db.sh
-
-    #-----------------------------------------------------------------------
-    # List all PostgreSQL Flexible Servers and their databases, then
-    # trigger an on-demand backup for each server
-    #-----------------------------------------------------------------------
-    - echo "Listing PostgreSQL Flexible Servers in RG: $AZURE_RESOURCE_GROUP …"
     - |
-      SERVERS=$(az postgres flexible-server list --resource-group "$AZURE_RESOURCE_GROUP" --query "[].name" -o tsv)
-      echo "Found servers: $SERVERS"
+      set -e
+      # Install utility packages (jq for JSON parsing, curl for notifications, mailutils optional, pg_dump)
+      apt-get update -y && apt-get install -y jq curl postgresql-client > /dev/null
 
-      DB_REPORT=""
-      for SERVER in $SERVERS; do
-        echo "\n=== $SERVER ==="
-        echo "Listing databases …"
-        az postgres flexible-server db list --resource-group "$AZURE_RESOURCE_GROUP" --server-name "$SERVER" -o table || true
+      # Log function
+      echo_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 
-        echo "Triggering on-demand backup for $SERVER …"
-        az postgres flexible-server backup create --resource-group "$AZURE_RESOURCE_GROUP" --server-name "$SERVER"
+      echo_log "Starting Azure authentication..."
+      az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
+      az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+      echo_log "Authenticated to Azure."
 
-        # Capture latest backup metadata for reporting (may take a short while to appear)
-        BACKUP_INFO=$(az postgres flexible-server backup list --resource-group "$AZURE_RESOURCE_GROUP" --server-name "$SERVER" --query "[-1]" -o json || echo "{}")
-        BACKUP_NAME=$(echo "$BACKUP_INFO" | jq -r '.name // "n/a"')
-        BACKUP_SIZE=$(echo "$BACKUP_INFO" | jq -r '.backupFileSizeInMb // "n/a"')
-        BACKUP_TIME=$(echo "$BACKUP_INFO" | jq -r '.completedTime // "n/a"')
-        DB_REPORT+="\n$SERVER  |  $BACKUP_NAME  |  ${BACKUP_SIZE}MB  |  $BACKUP_TIME"
+      echo_log "Checking for Recovery Services Vault: $AZURE_VAULT_NAME in resource group: $AZURE_RESOURCE_GROUP..."
+      VAULT_EXISTS=$(az backup vault list --resource-group "$AZURE_RESOURCE_GROUP" --query "[?name=='$AZURE_VAULT_NAME'] | length(@)")
+      if [ "$VAULT_EXISTS" -eq 0 ]; then
+        echo_log "Vault does not exist. Creating..."
+        az backup vault create --name "$AZURE_VAULT_NAME" --resource-group "$AZURE_RESOURCE_GROUP"
+        echo_log "Vault created."
+      else
+        echo_log "Vault already exists."
+      fi
+      echo_log "Vault check complete."
+
+      # PostgreSQL backup and upload logic
+      echo_log "Listing all Azure PostgreSQL servers in the subscription..."
+      PG_SERVERS=$(az postgres server list --query "[].name" -o tsv)
+      for SERVER in $PG_SERVERS; do
+        echo_log "Processing server: $SERVER"
+        SERVER_INFO=$(az postgres server show --name "$SERVER" --resource-group "$AZURE_RESOURCE_GROUP")
+        SERVER_FQDN=$(echo "$SERVER_INFO" | jq -r '.fullyQualifiedDomainName')
+        echo_log "Listing databases for server: $SERVER"
+        DBS=$(az postgres db list --server-name "$SERVER" --resource-group "$AZURE_RESOURCE_GROUP" --query "[].name" -o tsv)
+        for DB in $DBS; do
+          if [ "$DB" == "postgres" ] || [ "$DB" == "azure_maintenance" ]; then
+            continue
+          fi
+          echo_log "Backing up database: $DB on server: $SERVER"
+          BACKUP_FILE="${SERVER}_${DB}_$(date +%Y%m%d%H%M%S).sql"
+          PGPASSWORD="$PG_ADMIN_PASSWORD" pg_dump -h "$SERVER_FQDN" -U "$PG_ADMIN_USER@$SERVER" -d "$DB" -F c -b -v -f "$BACKUP_FILE"
+          echo_log "Backup for $DB completed: $BACKUP_FILE"
+          echo_log "Uploading $BACKUP_FILE to Azure Storage Account: $AZURE_STORAGE_ACCOUNT, Container: $AZURE_STORAGE_CONTAINER"
+          az storage blob upload \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_STORAGE_CONTAINER" \
+            --name "$BACKUP_FILE" \
+            --file "$BACKUP_FILE" \
+            --auth-mode key
+          echo_log "Upload of $BACKUP_FILE completed."
+          rm -f "$BACKUP_FILE"
+          echo_log "Local backup file $BACKUP_FILE removed."
+        done
       done
+      echo_log "All database backups and uploads completed."
 
-      # Persist report for later stages / artifacts if desired
-      echo -e "Server | Backup | Size | Time$DB_REPORT" > backup_report.txt
-
-    #-----------------------------------------------------------------------
-    # Send email notification (optional – requires CI variables)
-    #-----------------------------------------------------------------------
-    - |
+      #-----------------------------------------------------------------------
+      # Send email notification (optional – requires CI variables)
+      #-----------------------------------------------------------------------
       STATUS="SUCCESS"
       if [ "$CI_JOB_STATUS" != "success" ]; then STATUS="FAILED"; fi
-
       SUBJECT="Azure PG Backup $STATUS – pipeline $CI_PIPELINE_ID"
-      BODY="Backup status: $STATUS\nTimestamp: $(date)\nPipeline: $CI_PIPELINE_URL\nJob log: $CI_JOB_URL\n\n$(cat backup_report.txt)"
-
-      # Preferred: send via REST API (e.g. Mailgun / SendGrid). Requires EMAIL_API_ENDPOINT & EMAIL_API_KEY.
+      BODY="Backup status: $STATUS\nTimestamp: $(date)\nPipeline: $CI_PIPELINE_URL\nJob log: $CI_JOB_URL"
       if [ -n "$EMAIL_API_ENDPOINT" ] && [ -n "$EMAIL_API_KEY" ] && [ -n "$EMAIL_TO" ]; then
         echo "Sending notification email via API …"
         curl -s -X POST "$EMAIL_API_ENDPOINT" \
@@ -71,4 +86,8 @@ backup_db:
     EMAIL_TO: $EMAIL_TO
     EMAIL_API_ENDPOINT: $EMAIL_API_ENDPOINT
     EMAIL_API_KEY: $EMAIL_API_KEY
+    PG_ADMIN_USER: $PG_ADMIN_USER
+    PG_ADMIN_PASSWORD: $PG_ADMIN_PASSWORD
+    AZURE_STORAGE_ACCOUNT: $AZURE_STORAGE_ACCOUNT
+    AZURE_STORAGE_CONTAINER: $AZURE_STORAGE_CONTAINER
   when: manual
