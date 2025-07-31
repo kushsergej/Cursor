@@ -1,3 +1,18 @@
+# .gitlab-ci.yml for Azure PostgreSQL Flexible Server Backup/Restore via GitLab CI/CD
+# Implements requirements from Tasks/task.md
+# - Service principal authentication
+# - Uses az cli for all Azure operations
+# - Recovery Service Vault creation/check
+# - Lists all PostgreSQL flexible servers
+# - Backup (manual & scheduled)
+# - Restore (manual)
+# - Logs all actions
+#
+# Required CI/CD variables (set in GitLab project settings):
+#   AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   AZURE_RESOURCE_GROUP, AZURE_VAULT_NAME
+#   (for restore: RESTORE_SERVER_NAME, SOURCE_SERVER_NAME, RESTORE_TIME)
+
 stages:
   - backup
   - restore
@@ -8,7 +23,7 @@ backup_db:
   script:
     - |
       set -e
-      # Log function
+      # Logging function
       echo_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 
       echo_log "Starting Azure authentication..."
@@ -32,6 +47,7 @@ backup_db:
       for SERVER in $PG_SERVERS; do
         echo_log "Processing server: $SERVER"
         echo_log "Triggering backup for server: $SERVER"
+        # The backup is stored in the Recovery Services Vault by Azure policy
         az postgres flexible-server backup create \
           --name "$SERVER" \
           --resource-group "$AZURE_RESOURCE_GROUP"
@@ -45,6 +61,7 @@ backup_db:
     AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
     AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
     AZURE_VAULT_NAME: $AZURE_VAULT_NAME
+  # Triggered manually or by schedule (periodic)
   when: manual
   only:
     - schedules
@@ -56,13 +73,17 @@ restore_db:
   script:
     - |
       set -e
+      # Logging function
       echo_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
       echo_log "Starting Azure authentication..."
       az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
       az account set --subscription "$AZURE_SUBSCRIPTION_ID"
       echo_log "Authenticated to Azure."
       echo_log "Restoring Azure PostgreSQL Flexible Server..."
-      # Required variables: RESTORE_SERVER_NAME, SOURCE_SERVER_NAME, RESTORE_TIME (ISO8601)
+      # Required variables for restore:
+      #   RESTORE_SERVER_NAME: name for the new (restored) server
+      #   SOURCE_SERVER_NAME: name of the source server to restore from
+      #   RESTORE_TIME: point-in-time (ISO8601, e.g. 2024-06-01T12:00:00Z)
       az postgres flexible-server restore \
         --name "$RESTORE_SERVER_NAME" \
         --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -79,4 +100,5 @@ restore_db:
     RESTORE_SERVER_NAME: $RESTORE_SERVER_NAME
     SOURCE_SERVER_NAME: $SOURCE_SERVER_NAME
     RESTORE_TIME: $RESTORE_TIME
+  # Restore is always manual (on-demand)
   when: manual

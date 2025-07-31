@@ -6,8 +6,8 @@
 
 ### Description
 Automate a PostgreSQL/flexible database backup in Azure using GitLab CI/CD.
-Please, use https://learn.microsoft.com/en-us/azure/backup/backup-postgresql-cli for backup.
-Please, use https://learn.microsoft.com/en-us/azure/backup/restore-postgresql-database-cli for restore.
+Please, use https://learn.microsoft.com/en-us/azure/backup/back-up-azure-database-postgresql-flex-backup-cli for backup.
+Please, use https://learn.microsoft.com/en-us/azure/backup/backup-azure-database-postgresql-flex-restore-cli for restore.
 
 ### Requirements/Steps
 - service principle authentication in Azure
