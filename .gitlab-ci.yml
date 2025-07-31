@@ -1,5 +1,6 @@
 stages:
   - backup
+  - restore
 
 backup_db:
   stage: backup
@@ -7,9 +8,6 @@ backup_db:
   script:
     - |
       set -e
-      # Install utility packages (jq for JSON parsing, curl for notifications, mailutils optional, pg_dump)
-      apt-get update -y && apt-get install -y jq curl postgresql-client > /dev/null
-
       # Log function
       echo_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 
@@ -29,53 +27,17 @@ backup_db:
       fi
       echo_log "Vault check complete."
 
-      # PostgreSQL backup and upload logic
-      echo_log "Listing all Azure PostgreSQL servers in the subscription..."
-      PG_SERVERS=$(az postgres server list --query "[].name" -o tsv)
+      echo_log "Listing all Azure PostgreSQL Flexible Servers in the subscription..."
+      PG_SERVERS=$(az postgres flexible-server list --query "[].name" -o tsv)
       for SERVER in $PG_SERVERS; do
         echo_log "Processing server: $SERVER"
-        SERVER_INFO=$(az postgres server show --name "$SERVER" --resource-group "$AZURE_RESOURCE_GROUP")
-        SERVER_FQDN=$(echo "$SERVER_INFO" | jq -r '.fullyQualifiedDomainName')
-        echo_log "Listing databases for server: $SERVER"
-        DBS=$(az postgres db list --server-name "$SERVER" --resource-group "$AZURE_RESOURCE_GROUP" --query "[].name" -o tsv)
-        for DB in $DBS; do
-          if [ "$DB" == "postgres" ] || [ "$DB" == "azure_maintenance" ]; then
-            continue
-          fi
-          echo_log "Backing up database: $DB on server: $SERVER"
-          BACKUP_FILE="${SERVER}_${DB}_$(date +%Y%m%d%H%M%S).sql"
-          PGPASSWORD="$PG_ADMIN_PASSWORD" pg_dump -h "$SERVER_FQDN" -U "$PG_ADMIN_USER@$SERVER" -d "$DB" -F c -b -v -f "$BACKUP_FILE"
-          echo_log "Backup for $DB completed: $BACKUP_FILE"
-          echo_log "Uploading $BACKUP_FILE to Azure Storage Account: $AZURE_STORAGE_ACCOUNT, Container: $AZURE_STORAGE_CONTAINER"
-          az storage blob upload \
-            --account-name "$AZURE_STORAGE_ACCOUNT" \
-            --container-name "$AZURE_STORAGE_CONTAINER" \
-            --name "$BACKUP_FILE" \
-            --file "$BACKUP_FILE" \
-            --auth-mode key
-          echo_log "Upload of $BACKUP_FILE completed."
-          rm -f "$BACKUP_FILE"
-          echo_log "Local backup file $BACKUP_FILE removed."
-        done
+        echo_log "Triggering backup for server: $SERVER"
+        az postgres flexible-server backup create \
+          --name "$SERVER" \
+          --resource-group "$AZURE_RESOURCE_GROUP"
+        echo_log "Backup triggered for $SERVER."
       done
-      echo_log "All database backups and uploads completed."
-
-      #-----------------------------------------------------------------------
-      # Send email notification (optional – requires CI variables)
-      #-----------------------------------------------------------------------
-      STATUS="SUCCESS"
-      if [ "$CI_JOB_STATUS" != "success" ]; then STATUS="FAILED"; fi
-      SUBJECT="Azure PG Backup $STATUS – pipeline $CI_PIPELINE_ID"
-      BODY="Backup status: $STATUS\nTimestamp: $(date)\nPipeline: $CI_PIPELINE_URL\nJob log: $CI_JOB_URL"
-      if [ -n "$EMAIL_API_ENDPOINT" ] && [ -n "$EMAIL_API_KEY" ] && [ -n "$EMAIL_TO" ]; then
-        echo "Sending notification email via API …"
-        curl -s -X POST "$EMAIL_API_ENDPOINT" \
-          -H "Authorization: Bearer $EMAIL_API_KEY" \
-          -H "Content-Type: application/json" \
-          -d "{\"to\":\"$EMAIL_TO\",\"subject\":\"$SUBJECT\",\"text\":\"$BODY\"}" || echo "Email send failed (non-fatal)"
-      else
-        echo "Email variables not set – skipping email notification."
-      fi
+      echo_log "All server backups triggered."
   variables:
     AZURE_CLIENT_ID: $AZURE_CLIENT_ID
     AZURE_TENANT_ID: $AZURE_TENANT_ID
@@ -83,11 +45,38 @@ backup_db:
     AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
     AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
     AZURE_VAULT_NAME: $AZURE_VAULT_NAME
-    EMAIL_TO: $EMAIL_TO
-    EMAIL_API_ENDPOINT: $EMAIL_API_ENDPOINT
-    EMAIL_API_KEY: $EMAIL_API_KEY
-    PG_ADMIN_USER: $PG_ADMIN_USER
-    PG_ADMIN_PASSWORD: $PG_ADMIN_PASSWORD
-    AZURE_STORAGE_ACCOUNT: $AZURE_STORAGE_ACCOUNT
-    AZURE_STORAGE_CONTAINER: $AZURE_STORAGE_CONTAINER
+  when: manual
+  only:
+    - schedules
+    - manual
+
+restore_db:
+  stage: restore
+  image: mcr.microsoft.com/azure-cli
+  script:
+    - |
+      set -e
+      echo_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+      echo_log "Starting Azure authentication..."
+      az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
+      az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+      echo_log "Authenticated to Azure."
+      echo_log "Restoring Azure PostgreSQL Flexible Server..."
+      # Required variables: RESTORE_SERVER_NAME, SOURCE_SERVER_NAME, RESTORE_TIME (ISO8601)
+      az postgres flexible-server restore \
+        --name "$RESTORE_SERVER_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --source-server "$SOURCE_SERVER_NAME" \
+        --restore-time "$RESTORE_TIME"
+      echo_log "Restore triggered for $RESTORE_SERVER_NAME from $SOURCE_SERVER_NAME at $RESTORE_TIME."
+  variables:
+    AZURE_CLIENT_ID: $AZURE_CLIENT_ID
+    AZURE_TENANT_ID: $AZURE_TENANT_ID
+    AZURE_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+    AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
+    AZURE_VAULT_NAME: $AZURE_VAULT_NAME
+    RESTORE_SERVER_NAME: $RESTORE_SERVER_NAME
+    SOURCE_SERVER_NAME: $SOURCE_SERVER_NAME
+    RESTORE_TIME: $RESTORE_TIME
   when: manual
