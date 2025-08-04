@@ -1,104 +1,470 @@
-# .gitlab-ci.yml for Azure PostgreSQL Flexible Server Backup/Restore via GitLab CI/CD
-# Implements requirements from Tasks/task.md
-# - Service principal authentication
-# - Uses az cli for all Azure operations
-# - Recovery Service Vault creation/check
-# - Lists all PostgreSQL flexible servers
-# - Backup (manual & scheduled)
-# - Restore (manual)
-# - Logs all actions
-#
-# Required CI/CD variables (set in GitLab project settings):
-#   AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
-#   AZURE_RESOURCE_GROUP, AZURE_VAULT_NAME
-#   (for restore: RESTORE_SERVER_NAME, SOURCE_SERVER_NAME, RESTORE_TIME)
+# GitLab CI/CD Pipeline for Azure PostgreSQL Flexible Server Backup and Restore
+
+variables:
+  AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+  AZURE_TENANT_ID: $AZURE_TENANT_ID
+  AZURE_CLIENT_ID: $AZURE_CLIENT_ID
+  AZURE_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+  RESOURCE_GROUP: $RESOURCE_GROUP
+  VAULT_NAME: $VAULT_NAME
+  VAULT_LOCATION: $VAULT_LOCATION
+  POLICY_NAME: $POLICY_NAME
+  KEY_VAULT_NAME: $KEY_VAULT_NAME # Add explicit Key Vault name variable
 
 stages:
+  - setup
   - backup
   - restore
+  - maintenance
 
-backup_db:
-  stage: backup
-  image: mcr.microsoft.com/azure-cli
+# Global before_script for Azure authentication and validation
+before_script:
+  - echo "=== Starting Azure authentication and validation ==="
+  # Validate required variables
+  - |
+    if [ -z "$AZURE_SUBSCRIPTION_ID" ] || [ -z "$AZURE_TENANT_ID" ] || [ -z "$AZURE_CLIENT_ID" ] || [ -z "$AZURE_CLIENT_SECRET" ]; then
+      echo "Error: Required Azure authentication variables are not set"
+      echo "Please set: AZURE_SUBSCRIPTION_ID, AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET"
+      exit 1
+    fi
+  # Validate resource configuration
+  - |
+    if [ -z "$RESOURCE_GROUP" ] || [ -z "$VAULT_NAME" ] || [ -z "$VAULT_LOCATION" ] || [ -z "$POLICY_NAME" ]; then
+      echo "Error: Required resource configuration variables are not set"
+      echo "Please set: RESOURCE_GROUP, VAULT_NAME, VAULT_LOCATION, POLICY_NAME"
+      exit 1
+    fi
+  # Check Azure CLI availability
+  - |
+    if ! command -v az &> /dev/null; then
+      echo "Error: Azure CLI is not installed or not available in PATH"
+      exit 1
+    fi
+  # Azure authentication
+  - echo "Authenticating with Azure..."
+  - az login --service-principal --username $AZURE_CLIENT_ID --password $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+  - az account set --subscription $AZURE_SUBSCRIPTION_ID
+  - echo "Current subscription: $(az account show --query name -o tsv)"
+  - echo "=== Azure authentication completed successfully ==="
+
+# Global after_script for error handling
+after_script:
+  - |
+    if [ $CI_JOB_STATUS != "success" ]; then
+      echo "❌ Job failed with status: $CI_JOB_STATUS"
+      echo "Last 20 lines of logs:"
+      tail -20 $CI_PROJECT_DIR/.gitlab-ci.log 2>/dev/null || echo "No log file found"
+    else
+      echo "✅ Job completed successfully"
+    fi
+
+# Setup stage - Create recovery service vault and configure backup policy
+setup-vault:
+  stage: setup
   script:
+    - echo "=== Setting up Recovery Service Vault ==="
+    # Create resource group if it doesn't exist
     - |
-      set -e
-      # Logging function
-      echo_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
-
-      echo_log "Starting Azure authentication..."
-      az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
-      az account set --subscription "$AZURE_SUBSCRIPTION_ID"
-      echo_log "Authenticated to Azure."
-
-      echo_log "Checking for Recovery Services Vault: $AZURE_VAULT_NAME in resource group: $AZURE_RESOURCE_GROUP..."
-      VAULT_EXISTS=$(az backup vault list --resource-group "$AZURE_RESOURCE_GROUP" --query "[?name=='$AZURE_VAULT_NAME'] | length(@)")
-      if [ "$VAULT_EXISTS" -eq 0 ]; then
-        echo_log "Vault does not exist. Creating..."
-        az backup vault create --name "$AZURE_VAULT_NAME" --resource-group "$AZURE_RESOURCE_GROUP"
-        echo_log "Vault created."
+      if ! az group show --name $RESOURCE_GROUP --output none 2>/dev/null; then
+        echo "Creating resource group: $RESOURCE_GROUP"
+        az group create --name $RESOURCE_GROUP --location $VAULT_LOCATION
+        echo "✅ Resource group $RESOURCE_GROUP created successfully"
       else
-        echo_log "Vault already exists."
+        echo "ℹ️  Resource group $RESOURCE_GROUP already exists"
       fi
-      echo_log "Vault check complete."
+    # Create backup vault if it doesn't exist
+    - |
+      if ! az dataprotection backup-vault show --name $VAULT_NAME --resource-group $RESOURCE_GROUP --output none 2>/dev/null; then
+        echo "Creating Recovery Service Vault: $VAULT_NAME"
+        az dataprotection backup-vault create \
+          --resource-group $RESOURCE_GROUP \
+          --vault-name $VAULT_NAME \
+          --location $VAULT_LOCATION \
+          --type SystemAssigned \
+          --storage-settings datastore-type="VaultStore" type="LocallyRedundant"
+        echo "✅ Vault $VAULT_NAME created successfully"
+      else
+        echo "ℹ️  Vault $VAULT_NAME already exists"
+      fi
+    # Create backup policy
+    - echo "Creating backup policy for PostgreSQL Flexible Server..."
+    - |
+      if ! az dataprotection backup-policy show --name $POLICY_NAME --resource-group $RESOURCE_GROUP --vault-name $VAULT_NAME --output none 2>/dev/null; then
+        az dataprotection backup-policy create \
+          --backup-policy-name $POLICY_NAME \
+          --policy '{
+            "datasourceTypes": ["Microsoft.DBforPostgreSQL/flexibleServers/databases"],
+            "objectType": "BackupPolicy",
+            "policyRules": [
+              {
+                "backupParameters": {
+                  "backupType": "Full",
+                  "objectType": "AzureBackupParams"
+                },
+                "dataStore": {
+                  "dataStoreType": "VaultStore",
+                  "objectType": "DataStoreInfoBase"
+                },
+                "name": "Default",
+                "objectType": "AzureBackupRule",
+                "trigger": {
+                  "objectType": "ScheduleBasedTriggerContext",
+                  "schedule": {
+                    "repeatingTimeIntervals": ["R/2023-01-01T02:00:00+00:00/P1D"],
+                    "timeZone": "UTC"
+                  }
+                }
+              },
+              {
+                "isDefault": true,
+                "lifecycles": [
+                  {
+                    "deleteAfter": {
+                      "duration": "P30D",
+                      "objectType": "AbsoluteDeleteOption"
+                    },
+                    "sourceDataStore": {
+                      "dataStoreType": "VaultStore",
+                      "objectType": "DataStoreInfoBase"
+                    },
+                    "targetDataStoreCopySettings": []
+                  }
+                ],
+                "name": "Default",
+                "objectType": "AzureRetentionRule"
+              }
+            ]
+          }' \
+          --resource-group $RESOURCE_GROUP \
+          --vault-name $VAULT_NAME
+        echo "✅ Backup policy $POLICY_NAME created successfully"
+      else
+        echo "ℹ️  Backup policy $POLICY_NAME already exists"
+      fi
+    - echo "=== Setup completed successfully ==="
+  only:
+    - manual
+  tags:
+    - azure
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
 
-      echo_log "Listing all Azure PostgreSQL Flexible Servers in the subscription..."
-      PG_SERVERS=$(az postgres flexible-server list --query "[].name" -o tsv)
-      for SERVER in $PG_SERVERS; do
-        echo_log "Processing server: $SERVER"
-        echo_log "Triggering backup for server: $SERVER"
-        # The backup is stored in the Recovery Services Vault by Azure policy
-        az postgres flexible-server backup create \
-          --name "$SERVER" \
-          --resource-group "$AZURE_RESOURCE_GROUP"
-        echo_log "Backup triggered for $SERVER."
+# List all databases in the subscription
+list-databases:
+  stage: setup
+  script:
+    - echo "=== Listing all PostgreSQL Flexible Server databases ==="
+    - echo "PostgreSQL Flexible Servers in subscription:"
+    - az postgres flexible-server list --query "[].{Name:name, ResourceGroup:resourceGroup, Location:location, State:state}" --output table
+    - |
+      echo "Databases in each server:"
+      SERVERS=$(az postgres flexible-server list --query "[].{name:name, resourceGroup:resourceGroup}" -o json)
+      if [ "$(echo "$SERVERS" | jq length)" -eq 0 ]; then
+        echo "ℹ️  No PostgreSQL Flexible Servers found in subscription"
+      else
+        echo "$SERVERS" | jq -c '.[]' | while read -r server; do
+          SERVER_NAME=$(echo $server | jq -r '.name')
+          RESOURCE_GROUP=$(echo $server | jq -r '.resourceGroup')
+          echo "Server: $SERVER_NAME (Resource Group: $RESOURCE_GROUP)"
+          az postgres flexible-server db list \
+            --resource-group $RESOURCE_GROUP \
+            --server-name $SERVER_NAME \
+            --query "[].{Name:name, Charset:charset, Collation:collation}" \
+            --output table
+          echo "---"
+        done
+      fi
+    - echo "=== Database listing completed ==="
+  only:
+    - manual
+  tags:
+    - azure
+
+# Periodic backup job (can be scheduled)
+backup-databases:
+  stage: backup
+  script:
+    - echo "=== Starting periodic database backup ==="
+    # Get all PostgreSQL Flexible Servers
+    - |
+      SERVERS=$(az postgres flexible-server list --query "[].{name:name, resourceGroup:resourceGroup}" -o json)
+      echo "Found $(echo "$SERVERS" | jq length) PostgreSQL Flexible Server(s)"
+    # Process each server and its databases
+    - |
+      if [ "$(echo "$SERVERS" | jq length)" -eq 0 ]; then
+        echo "ℹ️  No PostgreSQL Flexible Servers found in subscription"
+        exit 0
+      fi
+
+      echo "$SERVERS" | jq -c '.[]' | while read -r server; do
+        SERVER_NAME=$(echo $server | jq -r '.name')
+        SERVER_RESOURCE_GROUP=$(echo $server | jq -r '.resourceGroup')
+        echo "Processing server: $SERVER_NAME in resource group: $SERVER_RESOURCE_GROUP"
+        
+        # Get databases in this server
+        DATABASES=$(az postgres flexible-server db list --resource-group $SERVER_RESOURCE_GROUP --server-name $SERVER_NAME --query "[].name" -o tsv)
+        
+        if [ -z "$DATABASES" ]; then
+          echo "ℹ️  No databases found in server $SERVER_NAME"
+          continue
+        fi
+        
+        echo "$DATABASES" | while read -r database; do
+          if [ ! -z "$database" ]; then
+            echo "Backing up database: $database"
+            DATASOURCE_ID="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourcegroups/$SERVER_RESOURCE_GROUP/providers/Microsoft.DBforPostgreSQL/flexibleServers/$SERVER_NAME/databases/$database"
+            BACKUP_INSTANCE_NAME="$SERVER_NAME-$database"
+            
+            # Check if backup instance already exists
+            if ! az dataprotection backup-instance show --name "$BACKUP_INSTANCE_NAME" --resource-group $RESOURCE_GROUP --vault-name $VAULT_NAME --output none 2>/dev/null; then
+              echo "Creating backup instance for database: $database"
+              
+              # Get Key Vault URI
+              KEY_VAULT_URI=""
+              if [ ! -z "$KEY_VAULT_NAME" ]; then
+                KEY_VAULT_URI="https://$KEY_VAULT_NAME.vault.azure.net/"
+              else
+                # Fallback: try to find a Key Vault
+                KEY_VAULT_NAME_FOUND=$(az keyvault list --query "[?contains(name, 'postgresql') || contains(name, 'kv') || contains(name, 'keyvault')].name" -o tsv | head -1)
+                if [ ! -z "$KEY_VAULT_NAME_FOUND" ]; then
+                  KEY_VAULT_URI="https://$KEY_VAULT_NAME_FOUND.vault.azure.net/"
+                  echo "Using Key Vault: $KEY_VAULT_NAME_FOUND"
+                else
+                  echo "⚠️  No Key Vault found, backup may fail if credentials are not properly configured"
+                  KEY_VAULT_URI="https://placeholder.vault.azure.net/"
+                fi
+              fi
+              
+              # Initialize backup instance
+              az dataprotection backup-instance initialize \
+                --datasource-id "$DATASOURCE_ID" \
+                --datasource-type AzureDatabaseForPostgreSQLFlexibleServer \
+                -l $VAULT_LOCATION \
+                --policy-id "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.DataProtection/backupVaults/$VAULT_NAME/backupPolicies/$POLICY_NAME" \
+                --secret-store-type AzureKeyVault \
+                --secret-store-uri "$KEY_VAULT_URI" > backup-instance.json
+              
+              # Create backup instance
+              az dataprotection backup-instance create \
+                --resource-group $RESOURCE_GROUP \
+                --vault-name $VAULT_NAME \
+                --backup-instance backup-instance.json \
+                --name "$BACKUP_INSTANCE_NAME"
+              
+              echo "✅ Backup instance created for database: $database"
+            else
+              echo "ℹ️  Backup instance already exists for database: $database"
+            fi
+            
+            # Trigger backup
+            echo "Triggering backup for database: $database"
+            az dataprotection backup-instance adhoc-backup \
+              --name "$BACKUP_INSTANCE_NAME" \
+              --rule-name "Default" \
+              --resource-group $RESOURCE_GROUP \
+              --vault-name $VAULT_NAME
+            
+            echo "✅ Backup triggered successfully for database: $database"
+          fi
+        done
       done
-      echo_log "All server backups triggered."
-  variables:
-    AZURE_CLIENT_ID: $AZURE_CLIENT_ID
-    AZURE_TENANT_ID: $AZURE_TENANT_ID
-    AZURE_CLIENT_SECRET: $AZURE_CLIENT_SECRET
-    AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
-    AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
-    AZURE_VAULT_NAME: $AZURE_VAULT_NAME
-  # Triggered manually or by schedule (periodic)
-  when: manual
+    - echo "=== Periodic backup completed ==="
   only:
     - schedules
-    - manual
+  tags:
+    - azure
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
 
-restore_db:
-  stage: restore
-  image: mcr.microsoft.com/azure-cli
+# Manual backup job
+manual-backup:
+  stage: backup
   script:
+    - echo "=== Starting manual database backup ==="
+    - echo "This job allows manual triggering of database backups"
+    # Same logic as periodic backup but for manual execution
     - |
-      set -e
-      # Logging function
-      echo_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
-      echo_log "Starting Azure authentication..."
-      az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
-      az account set --subscription "$AZURE_SUBSCRIPTION_ID"
-      echo_log "Authenticated to Azure."
-      echo_log "Restoring Azure PostgreSQL Flexible Server..."
-      # Required variables for restore:
-      #   RESTORE_SERVER_NAME: name for the new (restored) server
-      #   SOURCE_SERVER_NAME: name of the source server to restore from
-      #   RESTORE_TIME: point-in-time (ISO8601, e.g. 2024-06-01T12:00:00Z)
-      az postgres flexible-server restore \
-        --name "$RESTORE_SERVER_NAME" \
-        --resource-group "$AZURE_RESOURCE_GROUP" \
-        --source-server "$SOURCE_SERVER_NAME" \
-        --restore-time "$RESTORE_TIME"
-      echo_log "Restore triggered for $RESTORE_SERVER_NAME from $SOURCE_SERVER_NAME at $RESTORE_TIME."
-  variables:
-    AZURE_CLIENT_ID: $AZURE_CLIENT_ID
-    AZURE_TENANT_ID: $AZURE_TENANT_ID
-    AZURE_CLIENT_SECRET: $AZURE_CLIENT_SECRET
-    AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
-    AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
-    AZURE_VAULT_NAME: $AZURE_VAULT_NAME
-    RESTORE_SERVER_NAME: $RESTORE_SERVER_NAME
-    SOURCE_SERVER_NAME: $SOURCE_SERVER_NAME
-    RESTORE_TIME: $RESTORE_TIME
-  # Restore is always manual (on-demand)
-  when: manual
+      SERVERS=$(az postgres flexible-server list --query "[].{name:name, resourceGroup:resourceGroup}" -o json)
+      echo "Found $(echo "$SERVERS" | jq length) PostgreSQL Flexible Server(s)"
+
+      if [ "$(echo "$SERVERS" | jq length)" -eq 0 ]; then
+        echo "ℹ️  No PostgreSQL Flexible Servers found in subscription"
+        exit 0
+      fi
+
+      echo "$SERVERS" | jq -c '.[]' | while read -r server; do
+        SERVER_NAME=$(echo $server | jq -r '.name')
+        SERVER_RESOURCE_GROUP=$(echo $server | jq -r '.resourceGroup')
+        echo "Processing server: $SERVER_NAME in resource group: $SERVER_RESOURCE_GROUP"
+        
+        DATABASES=$(az postgres flexible-server db list --resource-group $SERVER_RESOURCE_GROUP --server-name $SERVER_NAME --query "[].name" -o tsv)
+        
+        if [ -z "$DATABASES" ]; then
+          echo "ℹ️  No databases found in server $SERVER_NAME"
+          continue
+        fi
+        
+        echo "$DATABASES" | while read -r database; do
+          if [ ! -z "$database" ]; then
+            echo "Backing up database: $database"
+            BACKUP_INSTANCE_NAME="$SERVER_NAME-$database"
+            
+            # Check if backup instance exists
+            if az dataprotection backup-instance show --name "$BACKUP_INSTANCE_NAME" --resource-group $RESOURCE_GROUP --vault-name $VAULT_NAME --output none 2>/dev/null; then
+              az dataprotection backup-instance adhoc-backup \
+                --name "$BACKUP_INSTANCE_NAME" \
+                --rule-name "Default" \
+                --resource-group $RESOURCE_GROUP \
+                --vault-name $VAULT_NAME
+              echo "✅ Manual backup triggered successfully for database: $database"
+            else
+              echo "❌ Backup instance not found for database: $database. Please run setup-vault first."
+            fi
+          fi
+        done
+      done
+    - echo "=== Manual backup completed ==="
+  only:
+    - manual
+  tags:
+    - azure
+
+# List available backups
+list-backups:
+  stage: backup
+  script:
+    - echo "=== Listing available backups ==="
+    - echo "Backup instances in vault $VAULT_NAME:"
+    - |
+      INSTANCES=$(az dataprotection backup-instance list --resource-group $RESOURCE_GROUP --vault-name $VAULT_NAME --query "[].{Name:name, DataSourceType:properties.dataSourceInfo.datasourceType, Status:properties.currentProtectionState}" --output table)
+      if [ -z "$INSTANCES" ]; then
+        echo "ℹ️  No backup instances found in vault"
+      else
+        echo "$INSTANCES"
+      fi
+    - |
+      echo "Recovery points for each backup instance:"
+      INSTANCE_NAMES=$(az dataprotection backup-instance list --resource-group $RESOURCE_GROUP --vault-name $VAULT_NAME --query "[].name" -o tsv)
+      if [ -z "$INSTANCE_NAMES" ]; then
+        echo "ℹ️  No backup instances found to list recovery points"
+      else
+        echo "$INSTANCE_NAMES" | while read -r instance; do
+          echo "Instance: $instance"
+          RECOVERY_POINTS=$(az dataprotection recovery-point list \
+            --backup-instance-name $instance \
+            --resource-group $RESOURCE_GROUP \
+            --vault-name $VAULT_NAME \
+            --query "[].{RecoveryPointId:id, RecoveryPointTime:properties.recoveryPointTime, RecoveryPointType:properties.recoveryPointType}" \
+            --output table)
+          if [ -z "$RECOVERY_POINTS" ]; then
+            echo "  No recovery points found"
+          else
+            echo "$RECOVERY_POINTS"
+          fi
+          echo "---"
+        done
+      fi
+    - echo "=== Backup listing completed ==="
+  only:
+    - manual
+  tags:
+    - azure
+
+# Manual restore job
+manual-restore:
+  stage: restore
+  script:
+    - echo "=== Starting manual database restore ==="
+    # Validate restore parameters
+    - |
+      if [ -z "$RESTORE_INSTANCE_NAME" ] || [ -z "$RESTORE_POINT_ID" ] || [ -z "$RESTORE_TARGET_CONTAINER_URI" ]; then
+        echo "❌ Error: Restore parameters not provided"
+        echo "Required variables:"
+        echo "  RESTORE_INSTANCE_NAME: Name of the backup instance to restore"
+        echo "  RESTORE_POINT_ID: Recovery point ID to restore from"
+        echo "  RESTORE_TARGET_CONTAINER_URI: Target storage container URI for restore"
+        exit 1
+      fi
+    # Validate backup instance exists
+    - |
+      if ! az dataprotection backup-instance show --name $RESTORE_INSTANCE_NAME --resource-group $RESOURCE_GROUP --vault-name $VAULT_NAME --output none 2>/dev/null; then
+        echo "❌ Error: Backup instance '$RESTORE_INSTANCE_NAME' not found"
+        exit 1
+      fi
+    # Prepare restore request
+    - echo "Preparing restore request..."
+    - |
+      az dataprotection backup-instance restore initialize-for-data-recovery-as-files \
+        --backup-instance-name $RESTORE_INSTANCE_NAME \
+        --recovery-point-id $RESTORE_POINT_ID \
+        --target-blob-container-url $RESTORE_TARGET_CONTAINER_URI \
+        --file-name-prefix "restore_$(date +%Y%m%d_%H%M%S)_" \
+        --resource-group $RESOURCE_GROUP \
+        --vault-name $VAULT_NAME > restore-request.json
+    # Trigger restore
+    - echo "Triggering restore operation..."
+    - |
+      az dataprotection backup-instance restore trigger \
+        --backup-instance-name $RESTORE_INSTANCE_NAME \
+        --resource-group $RESOURCE_GROUP \
+        --vault-name $VAULT_NAME \
+        --restore-request-object restore-request.json
+    - echo "✅ Restore operation triggered successfully"
+    - echo "Monitor the restore job using: az dataprotection job list --resource-group $RESOURCE_GROUP --vault-name $VAULT_NAME"
+    - echo "=== Manual restore completed ==="
+  only:
+    - manual
+  tags:
+    - azure
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+
+# Monitor backup jobs
+monitor-jobs:
+  stage: maintenance
+  script:
+    - echo "=== Monitoring backup and restore jobs ==="
+    - echo "Recent backup and restore jobs:"
+    - |
+      JOBS=$(az dataprotection job list --resource-group $RESOURCE_GROUP --vault-name $VAULT_NAME --query "[].{JobId:id, Operation:properties.operation, Status:properties.status, StartTime:properties.startTime, EndTime:properties.endTime}" --output table)
+      if [ -z "$JOBS" ]; then
+        echo "ℹ️  No recent jobs found in vault"
+      else
+        echo "$JOBS"
+      fi
+    - echo "Jobs across all vaults (from Resource Graph):"
+    - |
+      GRAPH_JOBS=$(az dataprotection job list-from-resourcegraph --datasource-type AzureDatabaseForPostgreSQLFlexibleServer --status Completed --query "[].{JobId:id, Operation:properties.operation, Status:properties.status, StartTime:properties.startTime}" --output table)
+      if [ -z "$GRAPH_JOBS" ]; then
+        echo "ℹ️  No completed jobs found across all vaults"
+      else
+        echo "$GRAPH_JOBS"
+      fi
+    - echo "=== Job monitoring completed ==="
+  only:
+    - manual
+  tags:
+    - azure
+
+# Cleanup old backups (optional maintenance)
+cleanup-old-backups:
+  stage: maintenance
+  script:
+    - echo "=== Cleaning up old backups ==="
+    - echo "ℹ️  Cleanup operation would be implemented here based on retention policies"
+    - echo "ℹ️  Current retention policy is set to 30 days in the backup policy"
+    - echo "ℹ️  This is a destructive operation and should be used carefully"
+    - echo "=== Cleanup completed ==="
+  only:
+    - manual
+  tags:
+    - azure
+  when: never
