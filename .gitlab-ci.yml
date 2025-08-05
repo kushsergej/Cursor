@@ -90,53 +90,58 @@ setup-vault:
     - echo "Creating backup policy for PostgreSQL Flexible Server..."
     - |
       if ! az dataprotection backup-policy show --name $POLICY_NAME --resource-group $RESOURCE_GROUP --vault-name $VAULT_NAME --output none 2>/dev/null; then
+        # Write policy JSON to a file to avoid shell escaping issues
+        cat > policy.json <<EOF
+{
+  "datasourceTypes": ["Microsoft.DBforPostgreSQL/flexibleServers/databases"],
+  "objectType": "BackupPolicy",
+  "policyRules": [
+    {
+      "backupParameters": {
+        "backupType": "Full",
+        "objectType": "AzureBackupParams"
+      },
+      "dataStore": {
+        "dataStoreType": "VaultStore",
+        "objectType": "DataStoreInfoBase"
+      },
+      "name": "Default",
+      "objectType": "AzureBackupRule",
+      "trigger": {
+        "objectType": "ScheduleBasedTriggerContext",
+        "schedule": {
+          "repeatingTimeIntervals": ["R/2023-01-01T02:00:00+00:00/P1D"],
+          "timeZone": "UTC"
+        }
+      }
+    },
+    {
+      "isDefault": true,
+      "lifecycles": [
+        {
+          "deleteAfter": {
+            "duration": "P30D",
+            "objectType": "AbsoluteDeleteOption"
+          },
+          "sourceDataStore": {
+            "dataStoreType": "VaultStore",
+            "objectType": "DataStoreInfoBase"
+          },
+          "targetDataStoreCopySettings": []
+        }
+      ],
+      "name": "Default",
+      "objectType": "AzureRetentionRule"
+    }
+  ]
+}
+EOF
+
         az dataprotection backup-policy create \
-          --backup-policy-name $POLICY_NAME \
-          --policy '{
-            "datasourceTypes": ["Microsoft.DBforPostgreSQL/flexibleServers/databases"],
-            "objectType": "BackupPolicy",
-            "policyRules": [
-              {
-                "backupParameters": {
-                  "backupType": "Full",
-                  "objectType": "AzureBackupParams"
-                },
-                "dataStore": {
-                  "dataStoreType": "VaultStore",
-                  "objectType": "DataStoreInfoBase"
-                },
-                "name": "Default",
-                "objectType": "AzureBackupRule",
-                "trigger": {
-                  "objectType": "ScheduleBasedTriggerContext",
-                  "schedule": {
-                    "repeatingTimeIntervals": ["R/2023-01-01T02:00:00+00:00/P1D"],
-                    "timeZone": "UTC"
-                  }
-                }
-              },
-              {
-                "isDefault": true,
-                "lifecycles": [
-                  {
-                    "deleteAfter": {
-                      "duration": "P30D",
-                      "objectType": "AbsoluteDeleteOption"
-                    },
-                    "sourceDataStore": {
-                      "dataStoreType": "VaultStore",
-                      "objectType": "DataStoreInfoBase"
-                    },
-                    "targetDataStoreCopySettings": []
-                  }
-                ],
-                "name": "Default",
-                "objectType": "AzureRetentionRule"
-              }
-            ]
-          }' \
-          --resource-group $RESOURCE_GROUP \
-          --vault-name $VAULT_NAME
+          --backup-policy-name "$POLICY_NAME" \
+          --policy "@policy.json" \
+          --resource-group "$RESOURCE_GROUP" \
+          --vault-name "$VAULT_NAME"
         echo "✅ Backup policy $POLICY_NAME created successfully"
       else
         echo "ℹ️  Backup policy $POLICY_NAME already exists"
