@@ -13,12 +13,6 @@
         "GITHUB_PERSONAL_ACCESS_TOKEN": "GITHUB_PERSONAL_ACCESS_TOKEN"
       }
     },
-    "github": {
-      "url": "https://api.githubcopilot.com/mcp/",
-      "headers": {
-        "Authorization": "Bearer GITHUB_PERSONAL_ACCESS_TOKEN"
-      }
-    },
     "GitLab": {
       "command": "docker run -i --rm -e GITLAB_PERSONAL_ACCESS_TOKEN -e GITLAB_API_URL -e GITLAB_READ_ONLY_MODE -e USE_GITLAB_WIKI -e USE_MILESTONE -e USE_PIPELINE iwakitakuma/gitlab-mcp",
       "env": {
