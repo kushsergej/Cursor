@@ -26,6 +26,30 @@
     },
     "MS Learn Docs": {
       "url": "https://learn.microsoft.com/api/mcp"
+    },
+    "DBHub": {
+      "command": "npx @bytebase/dbhub",
+      "env": {
+        "TRANSPORT": "stdio",
+        "DSN": "postgres://user:password@localhost:5432/dbname?sslmode=disable",
+        "READONLY": "true"
+      },
+      "args": []
+    },
+    "SonarQube": {
+      "command": "docker run -i --rm -e SONARQUBE_TOKEN -e SONARQUBE_URL mcp/sonarqube",
+      "env": {
+        "SONARQUBE_TOKEN": "<REPLACE_ME>",
+        "SONARQUBE_URL": "https://sonarcloud.io"
+      },
+      "args": []
+    },
+    "Auth0": {
+      "command": "npx -y @auth0/auth0-mcp-server run",
+      "env": {
+        "DEBUG": "auth0-mcp"
+      },
+      "args": []
     }
   }
 }
