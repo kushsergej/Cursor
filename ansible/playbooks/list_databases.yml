@@ -1,0 +1,60 @@
+---
+- name: List PostgreSQL Flexible Server Databases
+  hosts: localhost
+  gather_facts: false
+  
+  environment:
+    AZURE_CLIENT_ID: "{{ azure_client_id }}"
+    AZURE_SECRET: "{{ azure_secret }}"
+    AZURE_SUBSCRIPTION_ID: "{{ azure_subscription_id }}"
+    AZURE_TENANT: "{{ azure_tenant_id }}"
+  
+  tasks:
+    - name: Get PostgreSQL Flexible Server information
+      azure.azcollection.azure_rm_postgresqlflexible_info:
+        resource_group: "{{ postgresql_resource_group }}"
+        name: "{{ postgresql_server_name }}"
+      register: postgresql_info
+      
+    - name: Display server information
+      debug:
+        msg: "PostgreSQL Server: {{ postgresql_info.ansible_facts.azure_postgresqlflexibleservers[0].name }}"
+      
+    - name: Get server connection details
+      azure.azcollection.azure_rm_postgresqlflexible_info:
+        resource_group: "{{ postgresql_resource_group }}"
+        name: "{{ postgresql_server_name }}"
+      register: server_info
+      
+    - name: Extract connection string
+      set_fact:
+        connection_string: "{{ server_info.ansible_facts.azure_postgresqlflexibleservers[0].connection_string }}"
+      
+    - name: Parse connection string
+      set_fact:
+        db_host: "{{ connection_string | regex_search('host=([^;]+)', '\\1') }}"
+        db_user: "{{ connection_string | regex_search('user=([^;]+)', '\\1') }}"
+        db_password: "{{ connection_string | regex_search('password=([^;]+)', '\\1') }}"
+        db_name: "{{ connection_string | regex_search('dbname=([^;]+)', '\\1') }}"
+      
+    - name: List all databases
+      community.postgresql.postgresql_query:
+        login_host: "{{ db_host }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        db: "{{ db_name }}"
+        query: "SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres', 'azure_maintenance');"
+      register: database_list
+      
+    - name: Display database list
+      debug:
+        msg: "Available databases: {{ database_list.query_result | map(attribute='datname') | list }}"
+      
+    - name: Save database list to file
+      copy:
+        content: "{{ database_list.query_result | map(attribute='datname') | list | join('\n') }}"
+        dest: "{{ playbook_dir }}/../database_list.txt"
+      
+    - name: Display summary
+      debug:
+        msg: "Found {{ database_list.query_result | length }} databases in PostgreSQL Flexible Server"

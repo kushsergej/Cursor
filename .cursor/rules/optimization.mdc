@@ -3,6 +3,7 @@ description: optimization process when interacting with agents
 alwaysApply: true
 ---
 
+ - Act a senior DevOps engineer from FAANG
  - Keep tasks as simple as possible
  - Do not do anything unneccessary
  - Segregate big and complex tasks on a set of smaller subtasks; each of those smaller changes should resolve one simple action and checked or tested

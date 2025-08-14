@@ -1,0 +1,158 @@
+---
+- name: Restore PostgreSQL Database from Individual Backup
+  hosts: localhost
+  gather_facts: false
+  
+  environment:
+    AZURE_CLIENT_ID: "{{ azure_client_id }}"
+    AZURE_SECRET: "{{ azure_secret }}"
+    AZURE_SUBSCRIPTION_ID: "{{ azure_subscription_id }}"
+    AZURE_TENANT: "{{ azure_tenant_id }}"
+  
+  vars:
+    restore_dir: "{{ playbook_dir }}/../restore_workspace"
+    target_database: "{{ lookup('env', 'TARGET_DATABASE') | default('postgres') }}"
+    source_database: "{{ lookup('env', 'SOURCE_DATABASE') | default('') }}"
+    backup_timestamp: "{{ lookup('env', 'BACKUP_TIMESTAMP') | default('') }}"
+  
+  tasks:
+    - name: Create restore workspace directory
+      file:
+        path: "{{ restore_dir }}"
+        state: directory
+        mode: '0755'
+      
+    - name: Get PostgreSQL Flexible Server information
+      azure.azcollection.azure_rm_postgresqlflexible_info:
+        resource_group: "{{ postgresql_resource_group }}"
+        name: "{{ postgresql_server_name }}"
+      register: postgresql_info
+      
+    - name: Extract connection details
+      set_fact:
+        connection_string: "{{ postgresql_info.ansible_facts.azure_postgresqlflexibleservers[0].connection_string }}"
+        db_host: "{{ postgresql_info.ansible_facts.azure_postgresqlflexibleservers[0].connection_string | regex_search('host=([^;]+)', '\\1') }}"
+        db_user: "{{ postgresql_info.ansible_facts.azure_postgresqlflexibleservers[0].connection_string | regex_search('user=([^;]+)', '\\1') }}"
+        db_password: "{{ postgresql_info.ansible_facts.azure_postgresqlflexibleservers[0].connection_string | regex_search('password=([^;]+)', '\\1') }}"
+        db_name: "{{ postgresql_info.ansible_facts.azure_postgresqlflexibleservers[0].connection_string | regex_search('dbname=([^;]+)', '\\1') }}"
+      
+    - name: List available database backups in Azure Storage
+      azure.azcollection.azure_rm_storageblob_info:
+        resource_group: "{{ postgresql_resource_group }}"
+        storage_account_name: "{{ storage_account_name }}"
+        container_name: "{{ storage_container_name }}"
+        prefix: "database_backups/"
+      register: available_backups
+      
+    - name: Display available database backups
+      debug:
+        msg: "Available database backups: {{ available_backups.blobs | map(attribute='name') | list }}"
+      
+    - name: Set source database if not specified
+      set_fact:
+        source_database: "{{ available_backups.blobs | selectattr('name', 'match', '.*\\.sql$') | map(attribute='name') | first | regex_search('database_backups/([^/]+)/', '\\1') | default('postgres') }}"
+      when: source_database == ""
+      
+    - name: Set backup timestamp if not specified
+      set_fact:
+        backup_timestamp: "{{ available_backups.blobs | selectattr('name', 'match', '.*' + source_database + '.*\\.sql$') | sort(attribute='properties.last_modified') | last | map(attribute='name') | first | regex_search('.*_([0-9-]+)\\.sql$', '\\1') | default('') }}"
+      when: backup_timestamp == ""
+      
+    - name: Find specific backup file for restore
+      set_fact:
+        backup_blob_name: "{{ available_backups.blobs | selectattr('name', 'match', 'database_backups/' + source_database + '/' + source_database + '_.*\\.sql$') | sort(attribute='properties.last_modified') | last | map(attribute='name') | first }}"
+      
+    - name: Display selected backup for restore
+      debug:
+        msg: |
+          Restore Details:
+          - Source Database: {{ source_database }}
+          - Target Database: {{ target_database }}
+          - Backup File: {{ backup_blob_name }}
+          - Backup Timestamp: {{ backup_timestamp }}
+      
+    - name: Fail if no backup found
+      fail:
+        msg: "No backup found for database {{ source_database }}"
+      when: backup_blob_name is not defined or backup_blob_name == ""
+      
+    - name: Download backup file from Azure Storage
+      azure.azcollection.azure_rm_storageblob:
+        resource_group: "{{ postgresql_resource_group }}"
+        storage_account_name: "{{ storage_account_name }}"
+        container_name: "{{ storage_container_name }}"
+        blob_name: "{{ backup_blob_name }}"
+        dest: "{{ restore_dir }}/restore_backup.sql"
+        mode: download
+      register: download_result
+      
+    - name: Verify backup file downloaded
+      stat:
+        path: "{{ restore_dir }}/restore_backup.sql"
+      register: backup_file_stat
+      
+    - name: Display restore information
+      debug:
+        msg: |
+          Restore Information:
+          - Source Database: {{ source_database }}
+          - Target Database: {{ target_database }}
+          - Backup File: {{ backup_blob_name }}
+          - Local File: {{ restore_dir }}/restore_backup.sql
+          - File Size: {{ backup_file_stat.stat.size }} bytes
+      
+    - name: Check if target database exists
+      community.postgresql.postgresql_query:
+        login_host: "{{ db_host }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        db: "{{ db_name }}"
+        query: "SELECT 1 FROM pg_database WHERE datname = '{{ target_database }}';"
+      register: db_exists_check
+      
+    - name: Drop existing target database
+      community.postgresql.postgresql_query:
+        login_host: "{{ db_host }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        db: "{{ db_name }}"
+        query: "DROP DATABASE IF EXISTS {{ target_database }};"
+      when: db_exists_check.query_result | length > 0
+      
+    - name: Create target database
+      community.postgresql.postgresql_query:
+        login_host: "{{ db_host }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        db: "{{ db_name }}"
+        query: "CREATE DATABASE {{ target_database }};"
+      
+    - name: Restore database from backup
+      command: >
+        psql -h {{ db_host }} -U {{ db_user }} -d {{ target_database }} 
+        --no-password --verbose --file={{ restore_dir }}/restore_backup.sql
+      environment:
+        PGPASSWORD: "{{ db_password }}"
+      register: restore_result
+      failed_when: restore_result.rc != 0
+      
+    - name: Display restore result
+      debug:
+        msg: "Restore completed: {{ restore_result.stdout }}"
+      
+    - name: Verify restore by listing tables
+      community.postgresql.postgresql_query:
+        login_host: "{{ db_host }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+        db: "{{ target_database }}"
+        query: "SELECT tablename FROM pg_tables WHERE schemaname = 'public';"
+      register: tables_list
+      
+    - name: Display restored tables
+      debug:
+        msg: "Restored tables: {{ tables_list.query_result | map(attribute='tablename') | list }}"
+      
+    - name: Display restore completion
+      debug:
+        msg: "Database restore completed successfully for {{ target_database }} from {{ source_database }} backup"
